@@ -1,0 +1,738 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 13 16:54:13 2019
+
+@author: Joe
+"""
+
+
+from __future__ import print_function
+import json
+import pandas as pd
+import sys
+import os
+import pickle
+   
+bigPapaRelPath = '\\ferg temp\\bigPapaModule' # path relative to /#BRIDEBOOK
+try:
+    filePath = os.path.dirname(os.path.abspath(__file__))
+except Exception:
+    filePath = 'C:\\Users\\Ferg\\Dropbox (Bridebook)\\Bridebook Team Folder\\#BRIDEBOOK\\10 Analytics\\_Ferg\\supplierEngagement'
+
+bigPapaPath = filePath[:filePath.index('#BRIDEBOOK')+10]+bigPapaRelPath
+sys.path.append(bigPapaPath)
+
+import WeeklyReportFunctions as wrf
+import mixpanelRequests as mp
+import jql_wrapper as jql
+import datetime
+#import calendar
+import fb_import_downloads as dl
+import numpy as np
+from tqdm import tqdm
+#from pydrive.auth import GoogleAuth
+#from pydrive.drive import GoogleDrive
+#import time
+#from dateutil import relativedelta as rd
+from dateutil.relativedelta import relativedelta
+
+os.chdir(filePath)
+
+
+def get_suppliers():
+    #get general supplier's info
+    df = dl.fb_extract_files('suppliers',ext='pickle')
+    supplierInfo = ['id', 'publicId', 'name','slug', 'phone','supplierEmail','email', 'supplierRegistered',
+                    'invite', "nameOfWeddingContact",
+                    "county", 'country', "website", "supplierUrl", "responseScore", "profileScore", 'supplierDeleted',
+                    'premium', 'endorsements', 'photos', 'specialOffers', 'targeting', 'inHouseCateringMaxPricePp',
+                    'inHouseCateringMinPricePp', 'inHouseCateringInfo', 'packagesTotalCostInfo',
+                    'packagesTotalCostNoOfGuests', 'packagesTotalCostMinPrice', 'packagesTotalCostMaxPrice',
+                    'venueHireOnlyInfo', 'venueHireOnlyMinPrice', 'venueHireOnlyMaxPrice', 'targetingPriceMinBudget',
+                    'targetingPriceAvgTotalSpend', 'packagesInfo', 'packagesMinNoOfGuests', 'packagesMinPricePp',
+                    'packagesMaxPricePp', 'weddingFairs', 'manualCheck', 'appearsInMainSearch', 'fakeProfile', 'lastUpdatedAt', 'bbDiscount']
+    RRVsup = df[supplierInfo]
+    
+    #get pooped info
+    manualCheck = pd.DataFrame.from_dict(df.manualCheck.to_dict()).T
+    RRVsup['poop'] = (manualCheck['poop']== True)
+    
+    #get venueType
+    venueType = pd.DataFrame.from_dict(df.venueType.to_dict()).T
+    venueTypeColumns = venueType.columns.tolist()
+    venueType['None'] = False
+    venueTypeColumns.insert(0, "None")
+    venueType = venueType[venueTypeColumns]
+    RRVsup['venueType'] = (venueType == True).idxmax(axis = 1)
+    RRVsup['otherVenueType'] = venueType.otherVenueTypeDetails
+    return RRVsup
+
+def get_enquiries(exclude_duplicates = True):
+    extractRelPath = '\\#BRIDEBOOK\\10 Analytics\\07 Firebase extract\\FB_extract_user_enquiries.txt'
+    user_enquiries = json.load(open(filePath[:filePath.index('Bridebook Team Folder')+21]+extractRelPath, encoding= "utf-8"))
+    fields_to_fetch = ['suppId', 'slug', 'enquiryId', 'userId',  'enquiryRead','createdAt', 'revealed', 'responded', 'booked', 'lost']  
+    
+    rev = []
+    for slug, info in user_enquiries.items():
+        for vid, vd in info.items():
+            if type(vd) == dict:
+                for uid, ud, in vd.items():
+                    rev.append([slug, vid, uid, ud])                   
+    data = pd.DataFrame(rev)
+    data.columns = ['slug', 'suppId', 'enquiryId', 'details']
+    
+    ### exclude wrong format, (i.e. slug = enquiryId, hence wrong structure)
+    data = data[data.slug.isin(wrf.slugs)]
+    
+    ### convert details dictionary into columns
+    enquiryDetails = pd.DataFrame.from_dict(data.details[data.details.notnull()].to_dict(), orient='index').fillna(False)
+    
+    #merge enquiry details with supplier details
+    data = data.merge(enquiryDetails, how = 'left', left_on = 'enquiryId', right_on = 'id')
+    
+    #fetch replied, booked and lost fields
+    progressDetails = pd.DataFrame.from_dict(data.progress[data.progress.notnull()].to_dict(), orient='index').fillna(False)
+    data = data.merge(progressDetails[['read', 'responded', 'booked']], how='left', left_index=True, right_index=True)
+    statusDetails = pd.DataFrame.from_dict(data.status[data.status.notnull()].to_dict(), orient='index').fillna(False)
+    data = data.merge(statusDetails, how='left', left_index=True, right_index=True)
+    data['duplicate'] = data.duplicated(['suppId','profileId'], keep = 'first')
+    print('Duplicate enquiries proportion ' + str(data.duplicate.sum()/len(data)))
+    
+    #remove duplicates, keeping the one that's first when sorting by read & revealed statuses
+    if exclude_duplicates:
+        data  = data.sort_values(['enquiryRead','revealed'], ascending=False).drop_duplicates(subset = ['suppId', 'profileId'], keep = 'first')
+    
+    data = data[fields_to_fetch]
+    return data
+
+def get_data(startDate, endDate, supp):
+    sDate_overall = str(startDate)
+    eDate_overall = str(endDate)
+    resPath = sDate_overall+'_'+eDate_overall+'_supplier_engagement_data_dict.pickle'
+    evDictList = [{'name': "profileViews",
+               'ev': "Viewed supplier profile",
+               'filt': "properties",
+               'idProp': "viewedSupplierId"},
+              {'name': "totalEnquiries",
+               'ev': "Emailed Supplier",
+               'filt': "properties",
+               'idProp': "contactedSupplierId"}]
+            
+    
+    term_match = """function term_match(e) {url_terms = /.*\/search\/wedding-venues\/(.*)?\?.*/.exec(e.properties.$current_url); term = e.properties.searchTerm ? e.properties.searchTerm : url_terms ? url_terms[1] :e.properties.weddingLocationShort;
+    term = !term || term.toLowerCase() == 'uk' ? 'united-kingdom' : term;
+    return term.toLowerCase().replace(/\s/g, '-');
+    }
+    """
+    
+    if resPath and os.path.exists(resPath):
+        print('Existing file found ('+resPath+'); reading it in...')
+        resDict = pickle.load(open(resPath, 'rb'))
+    else:
+        print('No existing file found ('+resPath+'); downloading data...')
+        # set up results dicts
+        resDict = {}
+
+        
+        # get dates for given month
+        sDate = str(startDate)
+        eDate = str(endDate)
+        for d in evDictList:
+            print('Downloading '+d['name']+' events for '+sDate+' to '+eDate)
+            script = jql.JQLmain(jql.JQLevents(sDate,eDate,[d['ev']]),
+                             jql.JQLfilter(d['filt']),
+                             ##This seemed to get rid of a fair amount of results
+                             ##But doesn't seem to be strictly "necessary"
+                             #jql.JQLfilter('properties.id'),
+                             jql.exclusionFilter('properties.userEmail'),
+                             jql.JQLgroupBy(['properties.'+d['idProp']]))
+            dfTemp = mp.mp_to_DF_clean(mp.mixpanelRequest(script),'id')
+            if d['name'] not in resDict:
+                resDict[d['name']] = supp[['slug']]
+            try:
+                resDict[d['name']][sDate] = dfTemp['value']
+                resDict[d['name']][sDate].fillna(0,inplace=True)
+            except Exception:
+                print('Error with '+d['name']+' for '+sDate+' to '+eDate)
+
+        print('Downloading searchAppearances events for '+sDate+' to '+eDate)
+        script = term_match+jql.JQLmain(jql.JQLevents(sDate,eDate,['Loaded search results']),
+                                    jql.JQLfilter('properties.loadedSearchResultsList'),
+                                    jql.exclusionFilter('properties.userEmail'),
+                                    jql.JQLmap('e => {return {userId: e.distinct_id, term: term_match(e), list: e.properties.loadedSearchResultsList, page: e.properties.searchPageNumber ? e.properties.searchPageNumber : null, loaded: new Date(e.time) > new Date(2018,7,1,0,0) ? (e.properties.searchPageNumber - 1) *  Math.ceil(e.properties.searchResultsLoaded / 18) * 18 + (e.properties.loadedSearchResultsList ? e.properties.loadedSearchResultsList.length : 0) : e.properties.searchResultsLoaded}}'))
+        viewed = mp.mp_to_DF_clean(mp.mixpanelRequest(script))
+
+        # put all supplierIds that have appeared in search into one big list and collapse
+        print('Aggregating searchAppearances/searchPositions for '+sDate+' to '+eDate)
+        tupList = []
+        for i in tqdm(viewed.index):
+            tempList = viewed.loc[i, 'list']
+            tempTerm = viewed.loc[i, 'term']
+            tempLen = viewed.loc[i, 'loaded'] - len(tempList) + 1
+            tempPage = viewed.loc[i, 'page']
+            tupList += [(x, tempLen+i, tempPage, tempTerm) for i, x in enumerate(tempList)]
+        tempDF = pd.DataFrame(tupList)
+
+        if 'searchAppearances' not in resDict:
+            resDict['searchAppearances'] = supp[['slug']]
+            resDict['searchPositions'] = supp[['slug']]
+            resDict['searchPages'] = supp[['slug']]
+            resDict['searchAppearances_county'] = supp[['slug']]
+            resDict['searchPositions_county'] = supp[['slug']]
+            resDict['searchPages_county'] = supp[['slug']]
+
+        viewedGroup = tempDF.groupby(0)
+        try:
+            resDict['searchAppearances'][sDate] = viewedGroup[0].count()
+            resDict['searchAppearances'][sDate].fillna(0,inplace=True)
+            resDict['searchPositions'][sDate] = viewedGroup[1].mean()
+            resDict['searchPositions'][sDate].fillna(0,inplace=True)
+            resDict['searchPages'][sDate] = viewedGroup[2].mean()
+            resDict['searchPages'][sDate].fillna(0,inplace=True)
+        except Exception:
+            print('Error with searchAppearances/searchPositions/searchPages for '+sDate+' to '+eDate)
+
+        tempDF.set_index(0, inplace=True)
+        tempDF['county'] = supp['county']
+        viewedGroup_county = tempDF[tempDF.county == tempDF[3]].reset_index().groupby(0)
+        try:
+            resDict['searchAppearances_county'][sDate] = viewedGroup_county[0].count()
+            resDict['searchAppearances_county'][sDate].fillna(0,inplace=True)
+            #resDict['searchPositions_county'][sDate] = viewedGroup_county[1].mean()
+            #resDict['searchPositions_county'][sDate].fillna(0,inplace=True)
+            resDict['searchPages_county'][sDate] = viewedGroup_county[2].mean()
+            resDict['searchPages_county'][sDate].fillna(0,inplace=True)
+        except Exception:
+            print('Error with searchAppearances/searchPositions/searchPages (county) for '+sDate+' to '+eDate)
+
+        print('Done!')
+
+        # save results for later
+        pickle_out = open(resPath, 'wb')
+        pickle.dump(resDict, pickle_out)
+        pickle_out.close()
+
+    return resDict
+
+
+def stitchDataframe(outputDict):
+    totalEnquiries = outputDict['totalEnquiries']
+    
+    searchAppearances = outputDict['searchAppearances'].drop('slug', axis=1)
+        
+    profileViews = outputDict['profileViews'].drop('slug', axis=1)
+    
+    final_df = totalEnquiries.copy().drop('slug', axis=1)
+    final_df.columns = ['enquiries']
+    final_df['searchAppearances'] = searchAppearances
+    final_df['profileViews'] = profileViews
+     
+    return final_df
+
+def enquiryManipulations():
+    enqdata = get_enquiries()
+    enqdata = enqdata[enqdata.slug == 'venue']
+    
+    enquiriesReceived = enqdata.groupby('suppId').size()
+    
+    enqdata['enqRevealed'] = enqdata.revealed.apply(lambda x: True if x != False else False)
+    enqdata['enqRead'] = enqdata.enquiryRead.apply(lambda x: True if x != False else False)
+    enqsumdata = enqdata.groupby('suppId').sum()
+    enqsumdata['totalEnquiries'] = enquiriesReceived
+    
+    """This is where I imagine you should've calculated the value of enquiries read. That info doesn't seem to be passed right now"""
+    
+    enqsumdata['enqNotRevealed'] = enqsumdata['totalEnquiries'] - enqsumdata['enqRevealed']
+    enqsumdata['enqPercentageRevealed'] = enqsumdata['enqRevealed'] / enqsumdata['totalEnquiries']
+    enqsumdata['+80%RevealRate'] = enqsumdata.enqPercentageRevealed >= 0.8
+    enqsumdata['enqBooked'] = enqsumdata.booked
+    enqsumdata['enqLost'] = enqsumdata.lost
+    df = enqsumdata.drop(['lost', 'booked', 'responded', 'enqRevealed'], axis=1)
+    
+    return df
+
+
+def membershipType(y):
+    if y == True:
+        return 'PPB'
+    elif y == False:
+        return 'Subscription'
+    else:
+        return 'Standard'
+    
+def premiumMembershipInfo(df):
+    df['supplierMembershipType'] = df[df.premium.notnull()].premium.apply(lambda x: x['ppb'] if len(x)> 3 else False)
+    df['supplierMembershipType'] = df.supplierMembershipType.apply(membershipType)
+    
+    #Discovering supplier tier
+    df['supplierMembershipTier'] = df[df.premium.notnull()].premium.apply(lambda x: x['tier'])
+    
+    #Find time that the venue signed up to premium
+    df['supplierMembershipSignupDate'] = df[df.premium.notnull()].premium.apply(lambda x: x['tierCreatedAt']if len(x)> 2 else x['tierUpdatedAt'])
+    df['supplierMembershipSignupDate'] = df[df.supplierMembershipSignupDate.notnull()].supplierMembershipSignupDate.apply(lambda x: pd.to_datetime(x, unit='ms').date())
+    
+    return df
+
+def get_reviews(): 
+    reviewPath = '\\#BRIDEBOOK\\10 Analytics\\07 Firebase extract\\FB_extract_reviews.txt'
+    reviews = json.load(open(filePath[:filePath.index('Bridebook Team Folder')+21]+reviewPath, encoding= "utf-8"))
+    dp = reviews  
+    dp = json.dumps(dp)
+    dp = json.loads(dp)
+    rev = [] 
+    for slug, suppliers in dp.items():
+        for supID, reviews in suppliers.items():
+            for review_id, info in reviews.items():
+                rev.append([supID, slug, info["message"], info["createdAt"], info["from"], info["stars"], info["weddingDate"], info["title"], info["name"]])
+    bbwa_reviews = pd.DataFrame(rev)
+    bbwa_reviews.columns = ['Supplier_ID', 'slug', 'message', 'createdAt', 'person_from', 'star_rating', 'weddingDate', 'title', 'name']
+    bbwa_reviews = bbwa_reviews.set_index("Supplier_ID")
+    bbwa_reviews = bbwa_reviews[bbwa_reviews.slug == 'venue']
+    bbwa_reviews['date'] = bbwa_reviews.createdAt.apply(wrf.from_unix_timestamp_to_date)
+    bbwa_count = bbwa_reviews.groupby('Supplier_ID').size()
+    bbwa_count.columns = ['reviewCount']
+    return bbwa_count
+
+def manipulateSupplierInfo(df):
+    review_count = get_reviews()
+    df['noOfEndorsements'] = df[df.endorsements.notnull()].endorsements.apply(len)#Find number of endorsements per venue
+    df['reviewCount'] = review_count
+    df['noOfEndorsements'] = df['noOfEndorsements'] +df['reviewCount']
+    df = df.drop('reviewCount', axis=1)
+    df['noOfPhotos'] = df[df.photos.notnull()].photos.apply(len) #Find number of photos per venue. I haven't eliminated any stock photos.
+    df['coupleTargeting'] = df.targeting.notnull() #Does the venue have couple targeting
+    df['noOfspecialOffers'] = df[df.specialOffers.notnull()].specialOffers.apply(len) #How many special offers does the venue have!
+    df['weddingFairsTF'] = df.weddingFairs.notnull() #True false values for if weddings host a wedding fair
+    
+    return df
+    
+def godsKey(x): 
+    non_stock = 0
+    for i, j in x.items():
+        if 'stock/' in j['public_id']:
+            non_stock += 0
+        elif 'smartstock/' in j['public_id']:
+            non_stock += 0
+        elif 'initial/' in j['public_id']:
+            non_stock += 0
+        else:
+            non_stock +=1
+    return non_stock 
+
+def rankings(df):
+    df_cut = df[['name', 'county', 'country', 'profileScore', 'premium', 'supplierMembershipType', 'supplierMembershipTier', 'photos', 'supplierRegistered', 'manualCheck', 'appearsInMainSearch', 'supplierDeleted', 'fakeProfile']]
+    df_cut['county'] = df_cut.county.str.lower().str.strip().str.replace(r'[^a-zA-Z0-9]+', '-')
+    df_cut['premiumtf'] = df_cut.premium.notnull()
+    
+    """As per conversation a little while ago, fakeProfile bit shouldn't actually come into the consideration.
+    Removing it."""
+    
+    df_cut = df_cut[(df_cut.supplierDeleted != True)]
+    df_cut['pooptf'] = df_cut[df_cut.manualCheck.notnull()].manualCheck.apply(lambda x: x['poop'] if 'poop' in x.keys() else np.nan) 
+    #df_cut = df_cut[df_cut.pooptf != True]
+    df_cut['startf'] = df_cut[df_cut.manualCheck.notnull()].manualCheck.apply(lambda x: x['star'] if 'star' in x.keys() else np.nan)  
+    df_cut['containsStockPhoto'] = df_cut.photos.apply(lambda x: godsKey(x) if type(x) == dict else np.nan)
+    df_cut = df_cut[df_cut.containsStockPhoto != 0]
+    
+    
+    """Setting it to equal to true is not necessary here. Better practise just to state.
+    Amending it."""
+    """Not sure what you have done below here"""
+    
+    df_cut = df_cut[df_cut.startf | df_cut.appearsInMainSearch | df_cut.supplierRegistered]
+    
+    #Collecting relevant numbers and calculating appropriate supplier search score
+    df_cut['premiumBoost'] = df_cut.premiumtf.apply(lambda x: 2.5 if x == True else 0)
+    
+    
+    """With the new sales effort the boost will depend on the tier. Might need to add this in here"""
+    
+    
+    df_cut['boostValues'] = df_cut.supplierMembershipTier.apply(lambda x: 1.5 if x==3 else(1.5 if x==2 else(1.2 if x ==1 else 1)))
+    #= df_cut[df_cut.supplierMembershipType == 'PPB'].profileScore.apply(lambda x: 1.5*x)
+    #df_cut['boostValue'] = df_cut[df_cut.supplierMembershipType == 'Subscription'].profileScore.apply(lambda x: 1.8*x)
+    #df_cut['boostValue'] = df_cut.boostValue.fillna(df_cut.profileScore)
+    df_cut['boostedValues'] = df_cut.boostValues * df_cut.profileScore
+    df_cut = df_cut.drop('boostValues', axis=1)
+    df_cut['supplierRegisteredYN'] = df_cut.supplierRegistered.map({True:2, False:0})
+    df_cut['supplierSearchScore'] = df_cut.loc[:, 'premiumBoost':'supplierRegisteredYN'].apply(sum, axis=1)
+    
+    #Finding rankings!
+    df_supplierRanking = df_cut.sort_values('supplierSearchScore', ascending = False)
+    df_supplierRanking['Rank'] = df_supplierRanking.supplierSearchScore.rank(method='first',ascending = False)
+    df_supplierRankingCounty = df_supplierRanking.groupby('county') 
+    df_supplierRanking['countyRank'] = df_supplierRankingCounty.supplierSearchScore.rank(method='first',ascending = False)
+    
+    return df_supplierRanking
+
+def qualityPricing(df):
+    pricing_dict = {'PackagesPp': ['packagesMinPricePp','packagesMaxPricePp', 'packagesMinNoOfGuests'],
+                'PackagesTotal':['packagesTotalCostMinPrice','packagesTotalCostMaxPrice','packagesTotalCostNoOfGuests'],
+                'VenueHireOnly':['venueHireOnlyMinPrice','venueHireOnlyMaxPrice'],
+                'InHouseCateringOnly':['inHouseCateringMinPricePp','inHouseCateringMaxPricePp']
+                }
+                                      
+                                      
+    
+    qualPricing = pd.DataFrame()
+    
+    for key in pricing_dict:
+        if key == 'PackagesPp':
+            minPossiblePrice = 4
+        elif key == 'PackagesTotal':
+            minPossiblePrice = 900
+        elif key == 'VenueHireOnly':
+            minPossiblePrice = 100
+        else:
+            minPossiblePrice = 2
+        
+        pricing_list = pricing_dict[key]
+        df[pricing_list] = df[pricing_list].fillna(0).astype(int)
+        mask = (df[pricing_list].notnull()) & ~(df[pricing_list] == 0) & (df[pricing_list] > minPossiblePrice)
+        pricingCount = mask.sum(axis=1)
+        qualPricing[key] = (pricingCount == len(pricing_list))
+           
+    
+    qualPricing['Quality Pricing'] = qualPricing.sum(axis=1)>0
+    return qualPricing
+
+def topSuppInCounty(df):
+    #df = supp
+    highestEnqVenue = df.groupby(['county'])['enquiries'].transform(max) == df['enquiries']
+    highestEnq = df[highestEnqVenue].drop_duplicates(subset = ['county'], keep = 'first')[['county','name','enquiries']]
+    highestEnq.columns = ['county','nameOfHighestEnq','highestEnquiriesLastMonth']
+    
+    highestAppearancesVenue = df.groupby(['county'])['searchAppearances'].transform(max) == df['searchAppearances']
+    highestAppearances = df[highestAppearancesVenue].drop_duplicates(subset = ['county'], keep = 'first')[['county','name','searchAppearances']]
+    highestAppearances.columns = ['county','nameOfHighestSearchAppearances','highestSearchAppearancesLastMonth']
+    
+    highestProfileViewsVenue = df.groupby(['county'])['profileViews'].transform(max) == df['profileViews']
+    highestProfileViews = df[highestProfileViewsVenue].drop_duplicates(subset = ['county'], keep = 'first')[['county','name','profileViews']]
+    highestProfileViews.columns = ['county','nameOfHighestProfileViews','highestProfileViewsLastMonth']
+    
+    df = df.merge(highestEnq, how = 'left', left_on = 'county', right_on = 'county')
+    df = df.merge(highestAppearances, how = 'left', left_on = 'county', right_on = 'county')
+    df = df.merge(highestProfileViews, how = 'left', left_on = 'county', right_on = 'county')
+    df = df.set_index('id')
+    return df
+    
+def get_att_Bride_Bookings(end_date):
+    script = jql.isTest_functions()+"""function getMonth(eventTime) {
+      var d = new Date(eventTime);
+      var result = new Date(d.getFullYear(), d.getMonth(), 1);
+      result.setHours(0,0,0,0);
+      return  result.toISOString().split('T')[0]
+    }
+
+function main() {
+  return join(
+    Events({
+      from_date: '2016-01-01',
+      to_date:   '"""+str(end_date)+"""',
+      event_selectors: [
+        {event: "Emailed Supplier", selector: 'properties["contactedSupplierCategory"] == "venue"'},
+        {event: "Booked supplier", selector: 'properties["shortlistSupplierCategory"] == "venue"'},
+        {event: "Booked supplier", selector: 'properties["shortlistedSupplierCategory"] == "venue"'},
+        {event: "Booked supplier", selector: 'properties["bookedSupplierCategory"] == "venue"'},
+        {event: "Edited supplier booking", selector: 'properties["shortlistSupplierCategory"] == "venue"'},
+        {event: "Edited booking", selector: 'properties["bookedSupplierCategory"] == "venue"'},
+        {event: 'Updated main tasks', selector: 'properties["checklistMainTaskName"] == "Book Your Perfect Venue!"'},
+        {event: 'Updated budget item', selector: 'properties["budgetItemCategory"] == "venue"'},
+        {event: "Unbooked supplier", selector: 'properties["shortlistedSupplierCategory"] == "venue"'},
+        {event: 'Unbooked supplier', selector: 'properties["shortlistSupplierCategory"] == "venue"'}
+      ]
+    }),
+    People()
+  )
+  .filter(function(t) {
+    return t.user && t.event && (!t.user.properties.countryCode || (t.user.properties.countryCode == 'GB' && t.user.properties.$country_code == 'GB'))
+  })
+  .groupByUser(function(state, tuple) {
+    state = state || { emailedVenues: {}, bookedVenues: {}, unbookedVenues: {}, bridebookBookings: [], bridebookBookingValue: 0 , bridebookBookingCount: 0, checklist: false, budget: false, budgetValue: null};
+    _.each(tuple, function(t) {
+      if (t.event.name == "Emailed Supplier" && !(Object.keys(state.emailedVenues).includes(t.event.properties.contactedSupplierId))) { // record details of first enquiries
+        state.emailedVenues[t.event.properties.contactedSupplierId] = {};
+        state.emailedVenues[t.event.properties.contactedSupplierId].time = t.event.time;
+        state.emailedVenues[t.event.properties.contactedSupplierId].email = t.user.properties.userEmail;
+        state.emailedVenues[t.event.properties.contactedSupplierId].reg = t.event.properties.contactedSupplierRegistered;
+         state.emailedVenues[t.event.properties.contactedSupplierId].enqEmail = t.event.properties.contactedSupplierEmail;
+         state.emailedVenues[t.event.properties.contactedSupplierId].url = t.event.properties.contactedSupplierProfileURL;
+         state.emailedVenues[t.event.properties.contactedSupplierId].name1 = t.event.properties.weddingPartnerName1;
+         state.emailedVenues[t.event.properties.contactedSupplierId].name2 = t.event.properties.weddingPartnerName2
+         state.emailedVenues[t.event.properties.contactedSupplierId].wedDate = t.event.properties.weddingDateString
+         state.emailedVenues[t.event.properties.contactedSupplierId].userId = t.event.properties.id
+      }
+      else if (t.event.name == "Booked supplier") { // record details of bookings
+        var bookedId = null;
+        var bookedAmount = null;
+        var bookedName = null;
+        if (t.event.properties.shortlistSupplierId) { // deal with booking/editing events that have shortlistSupplierIds (current?)
+          bookedId = t.event.properties.shortlistSupplierId;
+          bookedAmount = t.event.properties.bookedValue;
+          bookedName = t.event.properties.shortlistSupplierName;
+        }
+        else if (t.event.properties.bookedSupplierId) { // deal with booking/editing events that have bookedSupplierIds (old?)
+          bookedId = t.event.properties.bookedSupplierId;
+          bookedAmount = t.event.properties.bookedSupplierAmount;
+          bookedName = t.event.properties.bookedSupplierName;
+        }
+        state.bookedVenues[bookedId] = t.event.time;
+        if ( Object.keys(state.emailedVenues).includes(bookedId) ) { // if booked venue has already been enquired to,  add to BB bookings
+          var bridebookBooking = {
+            supplierID: bookedId,
+            firstEnquiryTime: state.emailedVenues[bookedId].time,
+            userEmail: state.emailedVenues[bookedId].email,
+            bookingTime: state.bookedVenues[bookedId],
+            bookingAmount: bookedAmount,
+            supplierName: bookedName,
+            supplierRegistered:  state.emailedVenues[bookedId].reg,
+            supplierEmail: state.emailedVenues[bookedId].enqEmail,
+            supplierUrl: state.emailedVenues[bookedId].url,
+            partnerName1: state.emailedVenues[bookedId].name1,
+            partnerName2: state.emailedVenues[bookedId].name2,
+            wedDate: state.emailedVenues[bookedId].wedDate,
+            userId: state.emailedVenues[bookedId].userId
+          };
+          state.bridebookBookings.push(bridebookBooking);
+          state.bridebookBookingValue += bookedAmount;
+          state.bridebookBookingCount++;
+        }
+      }
+     else if (t.event.name == 'Unbooked supplier' && ((Object.keys(state.bookedVenues).includes(t.event.properties.shortlistSupplierId)) || (Object.keys(state.bookedVenues).includes(t.event.properties.shortlistedSupplierId)))) {
+        state.bridebookBookings = state.bridebookBookings.filter((b) => b.supplierID != t.event.properties.shortlistSupplierId)
+        }
+      else if (t.event.name == 'Updated main tasks'){state.checklist = true}
+      else if (t.event.name == 'Updated budget item') {state.budget = true,
+      state.budgetValue = t.event.properties.budgetItemActual
+      }
+    });
+    return state;
+  })
+  .filter(function(kv) { return kv.value.bridebookBookings.length > 0 }) // only keep users who have some bridebook attributable bookings
+  //.filter(function(kv) { return !kv.value.bridebookBookingValue || kv.value.bridebookBookingValue === 0 || (kv.value.bridebookBookingValue > 100 && kv.value.bridebookBookingValue < 50000) || (kv.value.budgetValue > 100 && kv.value.budgetValue < 50000)}) // only keep users without silly values
+  .map(function(kv) { return {bookings: kv.value.bridebookBookings, budgetValue: kv.value.budgetValue, checklist: kv.value.checklist}})
+  .filter((kv) => !kv.bookings[1]) //only keep users who have made one booking
+  //.filter( (kv) => !kv.value.bookings[1].supplierID)// only keep details of bridebook attributable bookings
+  .flatten() // get a bridebook attributable booking on each line
+  .map((kv) => { return{ value: {userId: kv.bookings[0].userId, timeDiff: Math.round((kv.bookings[0].bookingTime - kv.bookings[0].firstEnquiryTime) / 1000 / 60 / 60 / 24), bookingAmount: kv.bookings[0].bookingAmount, bookingTime: kv.bookings[0].bookingTime, firstEnquiryTime: kv.bookings[0].firstEnquiryTime, supplierID: kv.bookings[0].supplierID, supplierName: kv.bookings[0].supplierName, supplierRegistered: kv.bookings[0].supplierRegistered, supplierUrl: kv.bookings[0].supplierUrl, weddingPartnerName1: kv.bookings[0].partnerName1, weddingPartnerName2: kv.bookings[0].partnerName2, weddingDate: kv.bookings[0].wedDate, supplierEmail: kv.bookings[0].supplierEmail, userEmail: kv.bookings[0].userEmail, budgetValue: kv.budgetValue, checklist: kv.checklist, time: getMonth(kv.bookings[0].firstEnquiryTime)}}})
+  .filter((kv) => kv.value.supplierRegistered === true && exclusionCheck(kv.value.userEmail))
+}"""
+    data = mp.mixpanelRequest(script)
+    if data.ok:
+        df = mp.mp_to_DF_clean(data,unpack=True)
+        return df
+    else:
+        print("Problem getting bride booking data")
+        print(data.text)
+        
+def downloadBrochure(startDate, endDate):
+    downloadBrochure_script = jql.isTest_functions() + """
+    
+    
+    function main() {
+            return join(Events({
+                    from_date: '"""+str(startDate)+"""',
+                    to_date:   '"""+str(endDate)+"""',
+   
+    }), People())
+    .filter((e) => e.event && e.user && e.event.name == 'Downloaded supplier brochure' && e.event.properties["interactedSupplierCategory"] == "venue" && !(e.user.properties.userEmail && !exclusionCheck(e.user.properties.userEmail)) )
+    .groupBy(['event.properties.interactedSupplierId'], mixpanel.reducer.count());
+  
+    }
+    
+    """
+    downloadBrochure_data = mp.mixpanelRequest(downloadBrochure_script)
+    if downloadBrochure_data.ok:
+       downloadedBrochure_df = mp.mp_to_DF_clean(downloadBrochure_data, 'id', True)
+       return downloadedBrochure_df
+    else:
+        print('problem getting brochure data:')
+        print(downloadBrochure_data.text)
+        
+def getLastEdited():
+    last_edited_script = jql.isSupplier_functions() + jql.isTest_functions()+"""function main() {
+  return join(Events({
+    from_date: '2016-02-14',
+    to_date:   '"""+str(datetime.date.today())+"""',
+  }), People())
+  .filter((t) => t.event && t.user && !(t.user.properties.supplierEmail && !exclusionCheck(t.user.properties.supplierEmail)) && !(t.user.properties.userEmail && !exclusionCheck(t.user.properties.userEmail)) &&  (t.event.name == 'Saved supplier info on CMS Listing tab' || t.event.name.includes("photo on CMS") || t.event.name.includes("brochure on CMS") || t.event.name.includes("testimonial on CMS")|| t.event.name.includes('video on CMS') ||  t.event.name.includes("recommendation on CMS")) )
+  .groupByUser(['event.properties.supplierId'], function(state, tuple){
+      state = state || {supplierEmail: null,  time: null};
+      _.each(tuple, function(t) {
+        if (t.event.name == 'Saved supplier info on CMS Listing tab' || t.event.name.includes("photo on CMS") || t.event.name.includes("testimonial on CMS")|| t.event.name.includes("ed wedding fair on CMS") ||  t.event.name.includes('video on CMS') ||  t.event.name.includes("recommendation on CMS")) {
+          state.supplierId = t.event.properties.supplierId;
+          state.supplierEmail = t.user.properties.supplierEmail;
+          state.userEmail = t.user.properties.userEmail
+          state.time = t.event.time
+        }
+          });
+      return state;
+  })
+  .groupBy(["key.1"], function(previous_values, events) {
+    var value = { supplierEmail: null, time: null};
+    _.each(events, function(e) {
+      if (e.value.time > value.time){
+        value.time = e.value.time
+        value.supplierEmail = e.value.supplierEmail
+      }
+    })
+    _.each(previous_values, function(e) {
+      if (e.time > value.time){
+        value.time = e.time
+        value.supplierEmail = e.supplierEmail
+      }
+    })
+    return value;
+  });
+  }"""
+    last_edited_data = mp.mixpanelRequest(last_edited_script)
+    if last_edited_data.ok:
+       last_edited_df = mp.mp_to_DF_clean(last_edited_data, ['key1','key2'], True)
+       return last_edited_df
+    else:
+        print('problem getting last login data:')
+        print(last_edited_data.text)
+
+def totalEnquiries(supp):
+    totalEnquiries = supp.totalEnquiries
+    supp = supp.drop('totalEnquiries', axis = 1)
+    supp['totalEnquiries'] = totalEnquiries
+    return supp
+
+os.chdir(filePath)
+
+def main(timeframe):
+    #Import the data----------------------------------------------------------------------------------------------------------
+    supp = get_suppliers()
+    #Clean up the data--------------------------------------------------------------------------------------------------------
+    supp['test'] = (supp.email.str.contains('bridebook') | supp.email.str.contains('bbtest'))
+    supp = supp[supp.test == False]
+    supp = supp[supp.slug == 'venue']
+    supp = supp[supp.supplierDeleted != True]
+    """As per Beth's point, there's around 1304 venues that have supplierDeleted as true, might want to exclude those"""
+    """DONE"""
+    
+    if timeframe == 'monthly':
+        #Set dates for the script to use when determining values--------------------------------------------------------------------------------------
+        startDate = datetime.date.today().replace(day = 1) - relativedelta(months=+1)
+        endDate = startDate + relativedelta(months=+1) - datetime.timedelta(days=1)
+    elif timeframe == 'weekly':
+        #Set dates for the script to use when determining values--------------------------------------------------------------------------------------
+        startDate = wrf.monday(datetime.date.today()) - relativedelta(weeks=1)
+        endDate = startDate + relativedelta(weeks=+1) - datetime.timedelta(days=1)
+    else:
+        print('Choose monthly or weekly')
+        
+    #Enquiries, Appearences and Profile Views + Rankings added to supp-----------------------------------------------------------------------
+    """Data fetched in this function uses startDate and endDate as inclusive. This will cause an overlap of one day. Might want to adjust that."""
+    """DONE"""
+    
+    resDict = get_data(startDate, endDate, supp)
+    df = stitchDataframe(resDict)
+    
+    """Not a fan of picking columns based on their indexes. Already it's actually fetching the wrong column
+    As for me, the first column is "enquiries" where you're expecting "searchAppearances"""
+    
+    df['noEnqRanking'] = df.enquiries.rank(method='first',ascending = False)
+    df['noSearchRanking'] = df.searchAppearances.rank(method='first',ascending = False)
+    df['noProfileViewsRanking'] = df.profileViews.rank(method='first',ascending = False)
+    supp[['noSearchRanking', 'noEnqRanking', 'noProfileViewsRanking', 'searchAppearances', 'profileViews', 'enquiries']] = df[['noSearchRanking', 'noEnqRanking', 'noProfileViewsRanking', 'searchAppearances', 'profileViews', 'enquiries']]
+    
+    # Discovering the supplier membership type: Types are Standard, PPB, Subscription
+    """Might be ever so slightly more efficient to only pass columns you use as well as create the new columns than just
+    overwriting the whole dataframe"""
+    supp = premiumMembershipInfo(supp)
+    
+    supp = manipulateSupplierInfo(supp)
+    
+    #Number Of Enquires Recieved By A Venue 
+    """Should pull the number of enquiriesRead from this source as well, as per request"""
+    enquiryInfo = enquiryManipulations()
+    supp[enquiryInfo.columns.tolist()] = enquiryInfo
+    supp = supp.drop('enqRead', axis=1)
+    ##-----------------------------------------------------------------------------------------------------------------------
+    
+    """This creates a new dataframe that basically uses the old dataframe, removes some columns and adds extra columns
+    to calculate two new columns. Those are the only two values that are being used from that new dataframe that's
+    almost a copy - not entirely efficient. Would suggest reducing the next 5 lines to 2 lines, which will
+    additionally mean a new df is not required to be stored in memory"""
+    
+    rankings_df = rankings(supp)
+    
+    supp['RankUK'] = rankings_df.Rank
+    supp['RankUK'] = supp.RankUK.fillna('Does Not Appear In Search')
+    supp['countyRank'] = rankings_df.countyRank
+    supp['countyRank'] = supp.countyRank.fillna('Does Not Appear In Search')
+    
+    ##------------------------------------------------------------------------------------------------------------------------
+    
+    """This another similar instance to above, where you create a whole new dataframe to just pull out a single
+    column. Would be more efficient to just return that column and set a new column to what the function returns.
+    Saves you storing this dataframe in memory"""
+    
+    qualityPrice = qualityPricing(supp)
+    supp['qualityOfPricing'] = qualityPrice['Quality Pricing']
+    supp['qualityOfPricing'] = supp.qualityOfPricing.fillna(False)
+    
+    supp = topSuppInCounty(supp)
+    
+    attributableBookings = get_att_Bride_Bookings(endDate)
+    attributableBookings['bookingTime'] = attributableBookings['bookingTime'].apply(lambda x: pd.to_datetime(x, unit='ms').date())
+    
+    """The below states to include bookings made on the day of endDate. Currently that is the first day of the next month. Might
+    not be intentional there"""
+    
+    attributableBookings = attributableBookings[(attributableBookings.bookingTime >= startDate) & (attributableBookings.bookingTime <= endDate)].groupby('supplierID').size()
+    supp['attributableBookings'] = attributableBookings
+    
+    
+    """This creates a new dataframe, drops a column, renames a column, changes the values and then uses that single value. 
+    Might be better to do the amendments in the getLastEdited script and then only set the value to the outcome of the function."""
+    
+    lastEdited = getLastEdited()
+    lastEdited = lastEdited.drop('supplierEmail', axis=1).unstack()
+    lastEdited.columns = ['time']
+    lastEdited['time'] = lastEdited.time.apply(lambda x: pd.to_datetime(x, unit='ms').date())
+    supp['lastEditedAt'] = lastEdited['time']
+    
+    supp = supp.drop(['slug', 'country', 'premium', 'endorsements', 'photos', 'manualCheck', 'weddingFairs', 'lastUpdatedAt', 'specialOffers', 'test'],axis=1)
+    supp['enqRead'] = enquiryInfo['enqRead']
+    
+    brochureDownloads = downloadBrochure(startDate, endDate)
+    
+    if brochureDownloads.empty != True:
+        supp['brochureDownloads'] = brochureDownloads[0]
+    else:
+        supp['brochureDownloads'] = 0
+        
+    # 
+    supp['bbDiscounts'] = supp['bbDiscount']
+    supp = supp.drop('bbDiscount', axis=1)
+    
+    supp = totalEnquiries(supp)
+        
+    """The two lines below don't seem necessary given the later if-else statement"""
+    savePath = '\\#BRIDEBOOK\\10 Analytics\\05 Reporting\\46 Supplier Summary\\New KPI Dashboard\\'
+    saveName = 'SST Dashboard Monthly '+str(startDate) + '-' + str(endDate)+'.csv'
+    
+    """Bonus challenge: How might this be reduced to 2 lines? (Hint, the info you use for
+    the if statement, could you do without the if statement?)"""
+    if timeframe == 'monthly':
+        saveName = 'SST Dashboard Monthly '+str(startDate) + '-' + str(endDate)+'.csv'
+        saveNameLatest = 'SST Dashboard Monthly Latest.csv'
+    elif timeframe == 'weekly':
+        saveName = 'SST Dashboard Weekly '+str(startDate) + '-' + str(endDate)+'.csv'
+        saveNameLatest = 'SST Dashboard Weekly Latest.csv'
+    
+    supp.to_csv(filePath[:filePath.index('Bridebook Team Folder')+21] + savePath + saveName, encoding = 'utf-8')
+    supp.to_csv(filePath[:filePath.index('Bridebook Team Folder')+21] + savePath + saveNameLatest, encoding = 'utf-8')
+
+if __name__ == '__main__':
+    if datetime.date.today().weekday() == 0:
+        main('weekly')
+        print('weekly')
+    if datetime.date.today().day == 1:
+        main('monthly')
+        print('monthly')
+"""Would need to add the auto-run snippet"""
+    
